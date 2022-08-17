@@ -15,6 +15,7 @@ from localstack.constants import DEFAULT_VOLUME_DIR
 from localstack.runtime import hooks
 from localstack.utils.container_networking import get_main_container_name
 from localstack.utils.container_utils.container_client import (
+    ContainerClient,
     ContainerException,
     PortMappings,
     SimpleVolumeBind,
@@ -25,6 +26,7 @@ from localstack.utils.container_utils.docker_cmd_client import CmdDockerClient
 from localstack.utils.docker_utils import DOCKER_CLIENT
 from localstack.utils.files import cache_dir, chmod_r, mkdir
 from localstack.utils.functions import call_safe
+from localstack.utils.podman_utils import PODMAN_CLIENT
 from localstack.utils.run import run, to_str
 from localstack.utils.serving import Server
 from localstack.utils.sync import poll_condition
@@ -400,6 +402,8 @@ class LocalstackContainer:
     dns: Optional[str] = None
     workdir: Optional[str] = None
 
+    container_client: Optional[ContainerClient] = CmdDockerClient()
+
     def __init__(self, name: str = None):
         self.name = name or config.MAIN_CONTAINER_NAME
         self.entrypoint = os.environ.get("ENTRYPOINT", "")
@@ -426,7 +430,7 @@ class LocalstackContainer:
         return mount_volumes
 
     def run(self):
-        client = CmdDockerClient()
+        client = self.container_client
         client.default_run_outfile = self.logfile
 
         try:
@@ -460,7 +464,7 @@ class LocalstackContainer:
             raise
 
     def truncate_log(self):
-        with open(self.logfile, "wb") as fd:
+        with open(self.logfile, "w+b") as fd:
             fd.write(b"")
 
 
@@ -478,7 +482,7 @@ class LocalstackContainerServer(Server):
 
         if not self.is_container_running():
             return False
-        logs = DOCKER_CLIENT.get_container_logs(self.container.name)
+        logs = self.container.container_client.get_container_logs(self.container.name)
 
         if constants.READY_MARKER_OUTPUT not in logs.splitlines():
             return False
@@ -486,13 +490,13 @@ class LocalstackContainerServer(Server):
         return super().is_up()
 
     def is_container_running(self) -> bool:
-        return DOCKER_CLIENT.is_container_running(self.container.name)
+        return self.container.container_client.is_container_running(self.container.name)
 
     def wait_is_container_running(self, timeout=None) -> bool:
         return poll_condition(self.is_container_running, timeout)
 
     def do_run(self):
-        if DOCKER_CLIENT.is_container_running(self.container.name):
+        if self.container.container_client.is_container_running(self.container.name):
             raise ContainerExists(
                 'LocalStack container named "%s" is already running' % self.container.name
             )
@@ -501,7 +505,7 @@ class LocalstackContainerServer(Server):
 
     def do_shutdown(self):
         try:
-            CmdDockerClient().stop_container(
+            self.container.container_client.stop_container(
                 self.container.name, timeout=10
             )  # giving the container some time to stop
         except Exception as e:
@@ -533,6 +537,14 @@ def prepare_docker_start():
         chmod_r(config.dirs.tmp, 0o777)
     except Exception:
         pass
+
+
+def prepare_podman_start():
+    # prepare environment for docker start
+    container_name = config.MAIN_CONTAINER_NAME
+
+    if PODMAN_CLIENT.is_container_running(container_name):
+        raise ContainerExists('LocalStack container named "%s" is already running' % container_name)
 
 
 def configure_container(container: LocalstackContainer):
@@ -683,6 +695,43 @@ def start_infra_in_docker_detached(console):
     server.start()
     server.wait_is_container_running()
     console.log("detaching")
+
+
+def start_infra_in_podman():
+    prepare_podman_start()
+    container = LocalstackContainer()
+    container.container_client = PODMAN_CLIENT
+
+    # create and prepare container
+    configure_container(container)
+
+    container.truncate_log()
+
+    # printing the container log is the current way we're occupying the terminal
+    log_printer = FileListener(container.logfile, print)
+    log_printer.start()
+
+    def shutdown_handler(*args):
+        with shutdown_event_lock:
+            if shutdown_event.is_set():
+                return
+            shutdown_event.set()
+        print("Shutting down...")
+        server.shutdown()
+        # log_printer.close()
+
+    shutdown_event = threading.Event()
+    shutdown_event_lock = threading.RLock()
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    # start the Localstack container as a Server
+    server = LocalstackContainerServer(container)
+    try:
+        server.start()
+        server.join()
+    except KeyboardInterrupt:
+        print("ok, bye!")
+        shutdown_handler()
 
 
 def wait_container_is_ready(timeout: Optional[float] = None):

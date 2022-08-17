@@ -112,13 +112,14 @@ def cmd_status_services(format):
 
 @localstack.command(name="start", help="Start LocalStack")
 @click.option("--docker", is_flag=True, help="Start LocalStack in a docker container (default)")
+@click.option("--podman", is_flag=True, help="Start LocalStack in a docker container (default)")
 @click.option("--host", is_flag=True, help="Start LocalStack directly on the host")
 @click.option("--no-banner", is_flag=True, help="Disable LocalStack banner", default=False)
 @click.option(
     "-d", "--detached", is_flag=True, help="Start LocalStack in the background", default=False
 )
 @publish_invocation
-def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool):
+def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool, podman: bool):
     if docker and host:
         raise click.ClickException("Please specify either --docker or --host")
     if host and detached:
@@ -134,6 +135,8 @@ def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool):
     if not no_banner:
         if host:
             console.log("starting LocalStack in host mode :laptop_computer:")
+        elif podman:
+            console.log("starting LocalStack in Podman mode \U0001F9AD")
         else:
             console.log("starting LocalStack in Docker mode :whale:")
 
@@ -144,6 +147,8 @@ def cmd_start(docker: bool, host: bool, no_banner: bool, detached: bool):
 
     if host:
         bootstrap.start_infra_locally()
+    elif podman:
+        bootstrap.start_infra_in_podman()
     else:
         if detached:
             bootstrap.start_infra_in_docker_detached(console)
